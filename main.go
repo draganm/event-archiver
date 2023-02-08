@@ -7,10 +7,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/draganm/bolted"
 	"github.com/draganm/bolted/dbpath"
 	"github.com/draganm/bolted/embedded"
@@ -65,6 +69,16 @@ func main() {
 				Value:   "archive",
 				EnvVars: []string{"ARCHIVE_DIR"},
 			},
+			&cli.StringFlag{
+				Name:     "s3-bucket-name",
+				EnvVars:  []string{"S3_BUCKET_NAME"},
+				Required: true,
+			},
+			&cli.StringFlag{
+				Name:    "s3-key-prefix",
+				EnvVars: []string{"S3_KEY_PREFIX"},
+				Value:   "events",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			log := zapr.NewLogger(logger)
@@ -89,6 +103,11 @@ func main() {
 			if err != nil {
 				return fmt.Errorf("could not open event buffer client: %w", err)
 			}
+
+			awsSession := session.Must(session.NewSession())
+			uploader := s3manager.NewUploader(awsSession)
+			s3BucketName := c.String("s3-bucket-name")
+			s3KeyPrefix := c.String("s3-key-prefix")
 
 			db, err := embedded.Open(c.String("state-file"), 0700, embedded.Options{})
 			if err != nil {
@@ -165,7 +184,16 @@ func main() {
 							log.Info("batch full, archiving")
 							endTime := firsTime.Add(batchDuration)
 
-							err = archiveToFile(log, db, endTime, filepath.Join(archiveDir, fmt.Sprintf("%s.json.gz", firstID)))
+							err = archiveToS3(
+								ctx,
+								log,
+								db,
+								endTime,
+								filepath.Join(archiveDir, fmt.Sprintf("%s.json.gz", firstID)),
+								uploader,
+								s3BucketName,
+								s3KeyPrefix,
+							)
 							if err != nil {
 								log.Error(err, "failed to archive")
 							}
@@ -204,7 +232,16 @@ func main() {
 	app.RunAndExitOnError()
 }
 
-func archiveToFile(log logr.Logger, db bolted.Database, endTime time.Time, archiveFile string) (err error) {
+func archiveToS3(
+	ctx context.Context,
+	log logr.Logger,
+	db bolted.Database,
+	endTime time.Time,
+	archiveFile string,
+	uploader *s3manager.Uploader,
+	bucketName, keyPrefix string,
+) (err error) {
+
 	log = log.WithValues("archiveFile", archiveFile)
 
 	defer func() {
@@ -212,7 +249,7 @@ func archiveToFile(log logr.Logger, db bolted.Database, endTime time.Time, archi
 			os.Remove(archiveFile)
 		}
 	}()
-	f, err := os.OpenFile(archiveFile, os.O_CREATE|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(archiveFile, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return fmt.Errorf("could not open archive file: %w", err)
 	}
@@ -231,7 +268,7 @@ func archiveToFile(log logr.Logger, db bolted.Database, endTime time.Time, archi
 
 	enc := json.NewEncoder(gw)
 
-	return bolted.SugaredWrite(db, func(tx bolted.SugaredWriteTx) error {
+	err = bolted.SugaredWrite(db, func(tx bolted.SugaredWriteTx) error {
 		written := []string{}
 		for it := tx.Iterator(eventsPath); !it.IsDone(); it.Next() {
 			evTime, err := timeOfID(it.GetKey())
@@ -254,6 +291,28 @@ func archiveToFile(log logr.Logger, db bolted.Database, endTime time.Time, archi
 		return nil
 	})
 
+	if err != nil {
+		return fmt.Errorf("failed writing events to file: %w", err)
+	}
+
+	_, err = f.Seek(0, 0)
+	if err != nil {
+		return fmt.Errorf("could not seek file to start: %w", err)
+	}
+
+	// Upload the file to S3.
+	result, err := uploader.UploadWithContext(ctx, &s3manager.UploadInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(path.Join(keyPrefix, archiveFile)),
+		Body:   f,
+	})
+
+	if err != nil {
+		return fmt.Errorf("could not upload archive to s3: %w", err)
+	}
+
+	log.Info("archived events", "until", endTime, "s3Location", result.Location, "s3Version", result.VersionID)
+	return nil
 }
 
 func timeOfID(idString string) (time.Time, error) {

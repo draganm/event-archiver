@@ -2,15 +2,19 @@ module github.com/draganm/event-archiver
 
 go 1.19
 
-require github.com/go-logr/logr v1.2.2
+require (
+	github.com/aws/aws-sdk-go v1.44.196
+	github.com/go-logr/logr v1.2.2
+)
 
 require (
+	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/stretchr/testify v1.8.1 // indirect
 	github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673 // indirect
 	go.etcd.io/bbolt v1.3.6 // indirect
 	go.uber.org/atomic v1.9.0 // indirect
 	go.uber.org/multierr v1.7.0 // indirect
-	golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a // indirect
+	golang.org/x/sys v0.1.0 // indirect
 )
 
 require (
