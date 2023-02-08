@@ -9,11 +9,13 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/draganm/bolted"
 	"github.com/draganm/bolted/dbpath"
@@ -109,6 +111,52 @@ func main() {
 			s3BucketName := c.String("s3-bucket-name")
 			s3KeyPrefix := c.String("s3-key-prefix")
 
+			// archiveFiles := []string{}
+			s3Client := s3.New(awsSession)
+
+			lastIDFromS3 := ""
+
+			hasMorePages := true
+			var continuationToken *string
+
+			for hasMorePages {
+
+				list, err := s3Client.ListObjectsV2(&s3.ListObjectsV2Input{
+					Bucket:            aws.String(s3BucketName),
+					Prefix:            &s3KeyPrefix,
+					ContinuationToken: continuationToken,
+					// Delimiter:         aws.String("/"),
+				})
+
+				if err != nil {
+					return fmt.Errorf("could not list s3 objects")
+				}
+
+				for _, c := range list.Contents {
+					// archiveFiles = append(archiveFiles, aws.StringValue(c.Key))
+
+					key := aws.StringValue(c.Key)
+
+					lastIDFromKey, err := objectKeyToLastID(key)
+					if err != nil {
+						return fmt.Errorf("could not parse object name %s: %w", key, err)
+					}
+
+					if lastIDFromS3 < lastIDFromKey {
+						lastIDFromS3 = lastIDFromKey
+					}
+
+				}
+
+				hasMorePages = aws.BoolValue(list.IsTruncated)
+
+				if hasMorePages {
+					continuationToken = list.ContinuationToken
+				}
+			}
+
+			log.Info("archiveFiles", "lastID", lastIDFromS3)
+
 			db, err := embedded.Open(c.String("state-file"), 0700, embedded.Options{})
 			if err != nil {
 				return fmt.Errorf("could not open state file: %w", err)
@@ -120,6 +168,33 @@ func main() {
 				}
 				return nil
 			})
+
+			if err != nil {
+				return fmt.Errorf("could not initialize the database: %w", err)
+			}
+
+			if lastIDFromS3 != "" {
+				err = bolted.SugaredWrite(db, func(tx bolted.SugaredWriteTx) error {
+					it := tx.Iterator(eventsPath)
+					it.Seek(lastIDFromS3)
+					if it.IsDone() {
+						return nil
+					}
+
+					toDelete := []string{}
+
+					for ; !it.IsDone(); it.Prev() {
+						toDelete = append(toDelete, it.GetKey())
+					}
+
+					for _, id := range toDelete {
+						tx.Delete(eventsPath.Append(id))
+					}
+
+					return nil
+				})
+
+			}
 
 			if err != nil {
 				return fmt.Errorf("could not initialize the database: %w", err)
@@ -196,6 +271,7 @@ func main() {
 							)
 							if err != nil {
 								log.Error(err, "failed to archive")
+								time.Sleep(1 * time.Second)
 							}
 						}
 
@@ -230,6 +306,30 @@ func main() {
 		},
 	}
 	app.RunAndExitOnError()
+}
+
+func objectKeyToLastID(key string) (string, error) {
+	parts := strings.Split(key, "/")
+	if len(parts) < 1 {
+		return "", fmt.Errorf("split found no parts")
+	}
+
+	lastPart := parts[len(parts)-1]
+
+	if !strings.HasSuffix(lastPart, ".json.gz") {
+		return "", fmt.Errorf("key %s has no .json.gz suffix", key)
+	}
+
+	withoutPrefix := strings.TrimSuffix(lastPart, ".json.gz")
+
+	ids := strings.Split(withoutPrefix, ".")
+
+	if len(ids) != 2 {
+		return "", fmt.Errorf("expected 2 IDs, found %d", len(ids))
+	}
+
+	return ids[1], nil
+
 }
 
 func archiveToS3(
@@ -268,8 +368,10 @@ func archiveToS3(
 
 	enc := json.NewEncoder(gw)
 
-	err = bolted.SugaredWrite(db, func(tx bolted.SugaredWriteTx) error {
-		written := []string{}
+	written := []string{}
+
+	err = bolted.SugaredRead(db, func(tx bolted.SugaredReadTx) error {
+
 		for it := tx.Iterator(eventsPath); !it.IsDone(); it.Next() {
 			evTime, err := timeOfID(it.GetKey())
 			if err != nil {
@@ -283,11 +385,7 @@ func archiveToS3(
 			written = append(written, it.GetKey())
 		}
 
-		for _, k := range written {
-			tx.Delete(eventsPath.Append(k))
-		}
-
-		log.Info("arvhived events", "count", len(written))
+		log.Info("archived events to file", "count", len(written))
 		return nil
 	})
 
@@ -295,15 +393,23 @@ func archiveToS3(
 		return fmt.Errorf("failed writing events to file: %w", err)
 	}
 
+	err = f.Sync()
+	if err != nil {
+		return fmt.Errorf("could not sync archive file: %w", err)
+	}
+
 	_, err = f.Seek(0, 0)
 	if err != nil {
-		return fmt.Errorf("could not seek file to start: %w", err)
+		return fmt.Errorf("could not seek archive file to start: %w", err)
 	}
+
+	firsID := written[0]
+	lastID := written[len(written)-1]
 
 	// Upload the file to S3.
 	result, err := uploader.UploadWithContext(ctx, &s3manager.UploadInput{
 		Bucket: aws.String(bucketName),
-		Key:    aws.String(path.Join(keyPrefix, archiveFile)),
+		Key:    aws.String(path.Join(keyPrefix, fmt.Sprintf("%s.%s.json.gz", firsID, lastID))),
 		Body:   f,
 	})
 
@@ -312,6 +418,17 @@ func archiveToS3(
 	}
 
 	log.Info("archived events", "until", endTime, "s3Location", result.Location, "s3Version", result.VersionID)
+
+	err = bolted.SugaredWrite(db, func(tx bolted.SugaredWriteTx) error {
+
+		for _, k := range written {
+			tx.Delete(eventsPath.Append(k))
+		}
+
+		log.Info("deleted events from file", "count", len(written))
+		return nil
+	})
+
 	return nil
 }
 
